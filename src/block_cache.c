@@ -140,6 +140,9 @@ static int read_segment(struct block_cache *bc, struct block_cache_segment *seg,
         // Trimmed, so we'd be reading uninitialized data (in theory), if we called pread.
         memset(data, 0, BLOCK_CACHE_SEGMENT_SIZE);
     } else {
+        bc->stats.pread_call++;
+        fwup_warnx("pread at %lu", seg->offset/512);
+
         if (pread(bc->fd, data, BLOCK_CACHE_SEGMENT_SIZE, seg->offset) != BLOCK_CACHE_SEGMENT_SIZE)
             ERR_RETURN("pread of %d bytes at offset %llu", BLOCK_CACHE_SEGMENT_SIZE, seg->offset);
     }
@@ -156,6 +159,7 @@ static int make_segment_valid(struct block_cache *bc, struct block_cache_segment
         // If completely invalid, read it all in. No merging necessary
         OK_OR_RETURN(read_segment(bc, seg, seg->data));
         set_all_valid(seg);
+        bc->stats.read_all++;
     } else if (!all_valid) {
         // Mixed valid/invalid. Need to read to a temporary buffer and merge.
         OK_OR_RETURN(read_segment(bc, seg, bc->temp));
@@ -167,6 +171,7 @@ static int make_segment_valid(struct block_cache *bc, struct block_cache_segment
                 set_valid(seg, i);
             }
         }
+        bc->stats.read_partial++;
     }
     return 0;
 }
@@ -206,11 +211,14 @@ static int check_async_error(struct block_cache *bc)
 }
 static int do_async_write(struct block_cache *bc, struct block_cache_segment *seg)
 {
+    fwup_warnx("async_write at %lu", seg->offset/512);
     // Wait for the writer thread to complete the last set of writes
     // before starting new ones.
     pthread_mutex_lock(&bc->mutex_back);
     bc->seg_to_write = seg;
     pthread_mutex_unlock(&bc->mutex_to);
+
+    bc->stats.async_pwrite++;
 
     // NOTE: this check is best effort. If it catches something it will almost certainly
     //       be a previous write.
@@ -227,6 +235,8 @@ static void wait_for_write_completion(struct block_cache *bc, struct block_cache
         if (bc->seg_to_write != NULL)
             fwup_errx(EXIT_FAILURE, "Programming error with async writes. Please report");
 
+        bc->stats.wait_for_write_completion++;
+
         pthread_mutex_unlock(&bc->mutex_back);
     }
 }
@@ -235,6 +245,8 @@ static inline int do_sync_write(struct block_cache *bc, struct block_cache_segme
     if (bc->seg_to_write == seg) {
         wait_for_write_completion(bc, seg);
     } else {
+        fwup_warnx("sync_write at %lu", seg->offset/512);
+        bc->stats.sync_pwrite++;
         if (pwrite(bc->fd, seg->data, BLOCK_CACHE_SEGMENT_SIZE, seg->offset) != BLOCK_CACHE_SEGMENT_SIZE)
             ERR_RETURN("write failed at offset %llu. Check media size.", seg->offset);
     }
@@ -249,6 +261,7 @@ static inline int do_sync_write(struct block_cache *bc, struct block_cache_segme
     if (pwrite(bc->fd, seg->data, BLOCK_CACHE_SEGMENT_SIZE, seg->offset) != BLOCK_CACHE_SEGMENT_SIZE)
         ERR_RETURN("write failed at offset %llu. Check media size.", seg->offset);
 
+    bc->stats.sync_pwrite++;
     return 0;
 }
 static inline int do_async_write(struct block_cache *bc, struct block_cache_segment *seg)
@@ -438,10 +451,13 @@ static int get_segment(struct block_cache *bc, off_t offset, struct block_cache_
 
             seg->last_access = bc->timestamp++;
             *segment = seg;
+
+            bc->stats.cache_hit++;
             return 0;
         }
     }
 
+    bc->stats.cache_miss++;
     // Cache miss, so either use an unused entry or the LRU
     struct block_cache_segment *lru = &bc->segments[0];
     if (!lru->in_use) {
@@ -459,6 +475,7 @@ static int get_segment(struct block_cache *bc, off_t offset, struct block_cache_
         if (seg->last_access < lru->last_access)
             lru = seg;
     }
+    fwup_warnx("evict %lu", lru->offset / 256);
 
     OK_OR_RETURN(flush_segment(bc, lru));
     init_segment(bc, offset, lru);
